@@ -1,3 +1,4 @@
+ cat autovnc.sh
 #!/bin/bash
 
 # ==========================================================
@@ -24,7 +25,7 @@ echo "🔧 Начинаем настройку..."
 if ! id "$USERNAME" &>/dev/null; then
   echo "👤 Пользователь $USERNAME не найден — создаём..."
   adduser --disabled-password --gecos "" "$USERNAME"
-  
+
   # Установка пароля (интерактивно или из переменной)
   if [ -z "$VNC_PASSWD" ] || [ "$VNC_PASSWD" == "ChangeMe123" ]; then
     echo "🔒 Установите пароль для пользователя $USERNAME (для входа в систему и VNC):"
@@ -33,7 +34,7 @@ if ! id "$USERNAME" &>/dev/null; then
     echo "$USERNAME:$VNC_PASSWD" | chpasswd
     echo "✅ Пароль для $USERNAME установлен."
   fi
-  
+
   # Добавление в sudo (опционально)
   usermod -aG sudo "$USERNAME"
 else
@@ -53,7 +54,7 @@ GDM_CONF="/etc/gdm3/custom.conf"
 if [ -f "$GDM_CONF" ]; then
   echo "🖥️ Отключаем Wayland и настраиваем автовход..."
   cp "$GDM_CONF" "${GDM_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
-  
+
   # Включить секцию [daemon], если отсутствует
   if ! grep -q "^\[daemon\]" "$GDM_CONF"; then
     echo -e "\n[daemon]" >> "$GDM_CONF"
@@ -86,14 +87,22 @@ fi
 # === 3. Отключение спящего режима и блокировки (настройки пользователя) ===
 echo "⏳ Отключаем спящий режим и блокировку экрана для $USERNAME..."
 
-# Создаём профиль dconf, если нужно
 sudo -u "$USERNAME" dbus-run-session -- bash <<EOF
-gsettings set org.gnome.desktop.session idle-delay 0
-gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
-gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing'
-gsettings set org.gnome.desktop.screensaver idle-activation-enabled false
-gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
-gsettings set org.gnome.settings-daemon.plugins.power dpms-enabled false
+# Безопасное применение gsettings: игнорируем ошибки для отсутствующих ключей
+safe_set() {
+  if gsettings list-keys "\$1" | grep -q "^\$2\$"; then
+    gsettings set "\$1" "\$2" "\$3"
+  else
+    echo "⚠️ Ключ '\$2' отсутствует в схеме '\$1' — пропускаем."
+  fi
+}
+
+safe_set org.gnome.desktop.session idle-delay 0
+safe_set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+safe_set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing'
+safe_set org.gnome.desktop.screensaver idle-activation-enabled false
+safe_set org.gnome.settings-daemon.plugins.power idle-dim false
+safe_set org.gnome.settings-daemon.plugins.power dpms-enabled false
 EOF
 
 echo "✅ Энергосбережение и блокировка отключены."
@@ -103,28 +112,30 @@ echo "📦 Устанавливаем x11vnc и autocutsel..."
 apt update
 apt install -y x11vnc autocutsel
 
-# === 5. Настройка VNC-пароля и скриптов ===
-echo "🔐 Настраиваем VNC..."
+# === 5. Подготовка структуры для VNC ===
+echo "🔐 Подготавливаем окружение VNC (пароль будет задан вручную)..."
 
+USER_HOME="/home/$USERNAME"
+USER_UID=$(id -u "$USERNAME")
+
+# Создаём каталоги
 mkdir -p "$USER_HOME/.vnc"
-chown -R "$USERNAME":"$USERNAME" "$USER_HOME/.vnc"
+mkdir -p "$USER_HOME/.local/bin"
+mkdir -p "$USER_HOME/.config/autostart"
+chown -R "$USERNAME":"$USERNAME" "$USER_HOME/.vnc" "$USER_HOME/.local" "$USER_HOME/.config"
 
-# Сохраняем VNC-пароль
-if [ -z "$VNC_PASSWD" ] || [ "$VNC_PASSWD" == "ChangeMe123" ]; then
-  echo "👉 Запустите вручную от пользователя $USERNAME: x11vnc -storepasswd ~/.vnc/passwd"
-else
-  # Генерируем passwd-файл программно (требуется x11vnc)
-  echo "$VNC_PASSWD" | x11vnc -storepasswd - "$USER_HOME/.vnc/passwd" >/dev/null 2>&1
-  chown "$USERNAME":"$USERNAME" "$USER_HOME/.vnc/passwd"
-  chmod 600 "$USER_HOME/.vnc/passwd"
-  echo "✅ VNC-пароль установлен."
-fi
-
-# Создаём скрипт запуска
+# Создаём скрипт запуска (без пароля — он должен быть уже создан)
 cat > "$USER_HOME/.local/bin/start-vnc.sh" <<EOF
 #!/bin/bash
+
+# Отключаем DPMS и экранную заставку
+xset s off -dpms s noblank 2>/dev/null || true
+
+# Синхронизация буферов
 autocutsel -selection PRIMARY &
 autocutsel -selection CLIPBOARD &
+
+# Запуск x11vnc (требует ~/.vnc/passwd)
 x11vnc -auth /run/user/$USER_UID/gdm/Xauthority \\
        -display :0 \\
        -rfbauth $USER_HOME/.vnc/passwd \\
@@ -133,11 +144,10 @@ x11vnc -auth /run/user/$USER_UID/gdm/Xauthority \\
        -o $USER_HOME/.vnc/x11vnc.log
 EOF
 
-chown -R "$USERNAME":"$USERNAME" "$USER_HOME/.local"
+chown "$USERNAME":"$USERNAME" "$USER_HOME/.local/bin/start-vnc.sh"
 chmod +x "$USER_HOME/.local/bin/start-vnc.sh"
 
 # Создаём .desktop для автозапуска
-mkdir -p "$USER_HOME/.config/autostart"
 cat > "$USER_HOME/.config/autostart/x11vnc.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -148,8 +158,13 @@ NoDisplay=true
 X-GNOME-Autostart-enabled=true
 EOF
 
-chown -R "$USERNAME":"$USERNAME" "$USER_HOME/.config/autostart"
+chown "$USERNAME":"$USERNAME" "$USER_HOME/.config/autostart/x11vnc.desktop"
 chmod 644 "$USER_HOME/.config/autostart/x11vnc.desktop"
+
+echo "✅ Окружение VNC подготовлено."
+echo "❗ После перезагрузки и входа в сеанс выполните ОДИН РАЗ:"
+echo "      x11vnc -storepasswd ~/.vnc/passwd"
+echo "   и введите желаемый пароль для VNC (4–8 символов)."
 
 # === 6. Открытие порта (если ufw активен) ===
 if ufw status | grep -q "Status: active"; then
